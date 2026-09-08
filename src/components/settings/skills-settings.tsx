@@ -46,6 +46,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { Switch } from "@/components/ui/switch"
 import { Textarea } from "@/components/ui/textarea"
 import { cn } from "@/lib/utils"
 import { parseYamlFrontMatter } from "@/lib/skill-frontmatter"
@@ -53,6 +54,7 @@ import {
   acpDeleteAgentSkill,
   acpListAgents,
   acpListAgentSkills,
+  acpSetAgentSkillEnabled,
   loadFolderHistory,
   openFolder,
   acpReadAgentSkill,
@@ -166,6 +168,7 @@ export function SkillsSettings() {
   const t = useTranslations("SkillsSettings")
   const skillsT = t as unknown as SkillsTranslator
   const panelContainerRef = useRef<HTMLDivElement | null>(null)
+  const skillsLoadGenerationRef = useRef(0)
   const [panelContainerWidth, setPanelContainerWidth] = useState(0)
   const [agents, setAgents] = useState<AcpAgentInfo[]>([])
   const [loadingAgents, setLoadingAgents] = useState(true)
@@ -198,6 +201,9 @@ export function SkillsSettings() {
     skillsScope === "folder" ? selectedFolderPath : null
   const backendScope: AgentSkillScope =
     skillsScope === "folder" ? "project" : "global"
+  const skillsTargetKey = `${selectedAgentType ?? ""}|${backendScope}|${workspacePathForRequest ?? ""}`
+  const currentSkillsTargetKeyRef = useRef(skillsTargetKey)
+  currentSkillsTargetKeyRef.current = skillsTargetKey
 
   const [skillDraftId, setSkillDraftId] = useState("")
   const [skillDraftContent, setSkillDraftContent] = useState("")
@@ -206,6 +212,7 @@ export function SkillsSettings() {
   const [skillReading, setSkillReading] = useState(false)
   const [skillSaving, setSkillSaving] = useState(false)
   const [skillDeletingId, setSkillDeletingId] = useState<string | null>(null)
+  const [skillTogglingId, setSkillTogglingId] = useState<string | null>(null)
   const [deleteTargetSkill, setDeleteTargetSkill] =
     useState<AgentSkillItem | null>(null)
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
@@ -329,10 +336,19 @@ export function SkillsSettings() {
 
   const loadSkills = useCallback(
     async (agentType: AgentType) => {
+      const requestTargetKey = `${agentType}|${backendScope}|${workspacePathForRequest ?? ""}`
+      if (currentSkillsTargetKeyRef.current !== requestTargetKey) return null
+
+      const generation = ++skillsLoadGenerationRef.current
+      const isCurrentRequest = () =>
+        currentSkillsTargetKeyRef.current === requestTargetKey &&
+        skillsLoadGenerationRef.current === generation
+
       // Folder scope but no folder chosen → skip the fetch; UI prompts the
       // user to pick one. We still clear previous results so list doesn't
       // show stale items from another folder.
       if (skillsScope === "folder" && !workspacePathForRequest) {
+        setSkillsLoading(false)
         setSkillsError(null)
         setSkillsSupported(true)
         setSkillLocation(null)
@@ -348,6 +364,8 @@ export function SkillsSettings() {
           agentType,
           workspacePath: workspacePathForRequest,
         })
+        if (!isCurrentRequest()) return result
+
         setSkillsSupported(result.supported)
         setSkillLocation(
           result.locations.find(
@@ -359,6 +377,8 @@ export function SkillsSettings() {
         )
         return result
       } catch (err) {
+        if (!isCurrentRequest()) return null
+
         const message = toErrorMessage(err)
         setSkillsError(message)
         setSkillsSupported(true)
@@ -366,7 +386,7 @@ export function SkillsSettings() {
         setSkillItems([])
         return null
       } finally {
-        setSkillsLoading(false)
+        if (isCurrentRequest()) setSkillsLoading(false)
       }
     },
     [backendScope, skillsScope, workspacePathForRequest]
@@ -411,6 +431,49 @@ export function SkillsSettings() {
       setLoadingAgents(false)
     }
   }, [])
+
+  const handleToggleSkill = useCallback(
+    async (skill: AgentSkillItem) => {
+      if (!selectedAgent || !skill.can_toggle || skillTogglingId) return
+
+      const enabled = !skill.enabled
+      setSkillTogglingId(skill.id)
+
+      try {
+        await acpSetAgentSkillEnabled({
+          agentType: selectedAgent.agent_type,
+          scope: skill.scope,
+          skillId: skill.id,
+          workspacePath:
+            skill.scope === "project" ? workspacePathForRequest : null,
+          enabled,
+        })
+        const message = skillsT(enabled ? "toasts.enabled" : "toasts.disabled")
+        if (selectedAgent.agent_type === "codex") {
+          toast.success(message, {
+            description: skillsT("toasts.codexNewSession"),
+          })
+        } else {
+          toast.success(message)
+        }
+      } catch (err) {
+        toast.error(skillsT("toasts.toggleFailed"), {
+          description: toErrorMessage(err),
+        })
+      } finally {
+        invalidateAgentSkillsCache(selectedAgent.agent_type)
+        await loadSkills(selectedAgent.agent_type)
+        setSkillTogglingId(null)
+      }
+    },
+    [
+      loadSkills,
+      selectedAgent,
+      skillTogglingId,
+      skillsT,
+      workspacePathForRequest,
+    ]
+  )
 
   const handleCreateDraft = useCallback(() => {
     if (!selectedAgent) return
@@ -671,6 +734,10 @@ export function SkillsSettings() {
     // template here anymore — the right panel shows a placeholder until the
     // user picks a skill from the list or clicks "New Skill".
     setSelectedSkillId(null)
+    setSkillsError(null)
+    setSkillsSupported(true)
+    setSkillLocation(null)
+    setSkillItems([])
     setSkillDraftId("")
     setSkillDraftContent("")
     setIsContentEditing(false)
@@ -888,7 +955,7 @@ export function SkillsSettings() {
                 </div>
 
                 <div className="flex-1 min-h-0 overflow-y-auto p-2 space-y-1.5">
-                  {skillsLoading && (
+                  {skillsLoading && skillItems.length === 0 && (
                     <div className="text-xs text-muted-foreground flex items-center gap-1.5 p-1">
                       <Loader2 className="h-3.5 w-3.5 animate-spin" />
                       {t("loadingSkills")}
@@ -917,56 +984,99 @@ export function SkillsSettings() {
                       </div>
                     )}
 
-                  {!skillsLoading &&
-                    skillsSupported &&
+                  {skillsSupported &&
                     filteredSkills.map((skill) => {
                       const isActive = skill.id === selectedSkillId
                       const deleting = skillDeletingId === skill.id
+                      const availabilityHint = !skill.can_toggle
+                        ? skill.read_only
+                          ? skillsT("availability.readOnly")
+                          : skillsT("availability.cannotIsolate")
+                        : skill.enabled
+                          ? skillsT("availability.enabled")
+                          : skillsT("availability.disabled")
 
                       return (
                         <ContextMenu key={skill.id}>
                           <ContextMenuTrigger asChild>
-                            <button
-                              type="button"
+                            <div
                               className={cn(
-                                "w-full rounded-md border px-2 py-1.5 text-left transition-colors",
+                                "w-full rounded-md border flex items-center gap-2 transition-colors",
                                 isActive
                                   ? "border-primary/60 bg-primary/5"
                                   : "hover:bg-muted/30"
                               )}
-                              onClick={() => {
-                                handlePreviewSkill(skill).catch((err) => {
-                                  console.error(
-                                    "[SkillsSettings] preview skill failed:",
-                                    err
-                                  )
-                                })
-                              }}
                             >
-                              <div className="flex items-center gap-1.5 min-w-0">
-                                <span className="text-xs font-medium truncate">
-                                  {skill.name}
-                                </span>
-                                <Badge
-                                  variant="outline"
-                                  className="h-6 px-2 inline-flex items-center gap-1 text-xs leading-none shrink-0 border-blue-500/40 bg-blue-500/10 text-blue-600 dark:text-blue-400"
-                                >
-                                  {skill.scope}
-                                </Badge>
-                                {skill.read_only && (
+                              <button
+                                type="button"
+                                className="min-w-0 flex-1 px-2 py-1.5 text-left"
+                                onClick={() => {
+                                  handlePreviewSkill(skill).catch((err) => {
+                                    console.error(
+                                      "[SkillsSettings] preview skill failed:",
+                                      err
+                                    )
+                                  })
+                                }}
+                              >
+                                <div className="flex items-center gap-1.5 min-w-0">
+                                  <span className="text-xs font-medium truncate">
+                                    {skill.name}
+                                  </span>
                                   <Badge
                                     variant="outline"
-                                    title={t("systemHint")}
-                                    className="h-6 px-2 inline-flex items-center gap-1 text-xs leading-none shrink-0 border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400"
+                                    className="h-6 px-2 inline-flex items-center gap-1 text-xs leading-none shrink-0 border-blue-500/40 bg-blue-500/10 text-blue-600 dark:text-blue-400"
                                   >
-                                    {t("systemBadge")}
+                                    {skill.scope}
                                   </Badge>
-                                )}
+                                  {skill.read_only && (
+                                    <Badge
+                                      variant="outline"
+                                      title={t("systemHint")}
+                                      className="h-6 px-2 inline-flex items-center gap-1 text-xs leading-none shrink-0 border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400"
+                                    >
+                                      {t("systemBadge")}
+                                    </Badge>
+                                  )}
+                                </div>
+                                <div className="text-2xs text-muted-foreground truncate mt-1">
+                                  {skill.path}
+                                </div>
+                              </button>
+                              <div
+                                className="shrink-0 pr-2"
+                                onPointerDown={(event) => {
+                                  event.stopPropagation()
+                                }}
+                                onClick={(event) => {
+                                  event.stopPropagation()
+                                }}
+                              >
+                                <Switch
+                                  checked={skill.enabled}
+                                  onCheckedChange={() => {
+                                    handleToggleSkill(skill).catch((err) => {
+                                      console.error(
+                                        "[SkillsSettings] toggle skill failed:",
+                                        err
+                                      )
+                                    })
+                                  }}
+                                  disabled={
+                                    !skill.can_toggle ||
+                                    Boolean(skillTogglingId)
+                                  }
+                                  aria-label={skillsT(
+                                    "availability.toggleAria",
+                                    {
+                                      skill: skill.name,
+                                      agent: selectedAgent?.name ?? "",
+                                    }
+                                  )}
+                                  title={availabilityHint}
+                                />
                               </div>
-                              <div className="text-2xs text-muted-foreground truncate mt-1">
-                                {skill.path}
-                              </div>
-                            </button>
+                            </div>
                           </ContextMenuTrigger>
                           <ContextMenuContent>
                             <ContextMenuItem

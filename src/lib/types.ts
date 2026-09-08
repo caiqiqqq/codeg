@@ -3497,6 +3497,8 @@ export interface AgentSkillItem {
   path: string
   description: string | null
   read_only: boolean
+  enabled: boolean
+  can_toggle: boolean
 }
 
 export interface AgentSkillsListResult {
